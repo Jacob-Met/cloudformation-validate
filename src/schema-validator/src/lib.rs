@@ -296,7 +296,7 @@ pub fn getatt_data_with_overlays(overlay: &OverlayCatalog) -> Result<Arc<GetattD
 }
 
 pub struct SchemaValidator {
-    store: CompiledSchemaStore,
+    store: OnceLock<CompiledSchemaStore>,
     catalog: OverlayCatalog,
     init_metric: PhaseMetric,
     /// The shared schema-metadata catalog for this validator, resolved lazily on
@@ -337,8 +337,7 @@ impl SchemaValidator {
     /// Infallible constructor with no overlay schemas - used by `Default`.
     fn new_default() -> Self {
         let start = web_time::Instant::now();
-        let store = CompiledSchemaStore::new();
-        Self::finish(store, OverlayCatalog::default(), 0, start)
+        Self::finish(None, OverlayCatalog::default(), 0, start)
     }
 
     /// Construct a validator whose schema store has `additional_schemas` merged
@@ -384,7 +383,7 @@ impl SchemaValidator {
             applied += 1;
         }
         let catalog = build_validated_overlay_catalog(&store, &type_names)?;
-        Ok(Self::finish(store, catalog, applied, start))
+        Ok(Self::finish(Some(store), catalog, applied, start))
     }
 
     /// The overlay catalog derived from the final merged schema store. Empty
@@ -417,24 +416,31 @@ impl SchemaValidator {
     }
 
     fn finish(
-        store: CompiledSchemaStore,
+        store: Option<CompiledSchemaStore>,
         catalog: OverlayCatalog,
         overlays_applied: usize,
         start: web_time::Instant,
     ) -> Self {
-        // The fixed format-pattern tables are compiled here rather than on the
-        // first template, so first-template latency matches steady state.
-        validate::prewarm_statics();
-        let init_metric = phase_metric(start);
-        if overlays_applied > 0 {
+        let lazy_store = if let Some(store) = store {
+            validate::prewarm_statics();
+            let schema_count = store.len();
             info!(
-                "SchemaValidator initialized: {} schemas loaded, {overlays_applied} overlay schema(s) applied",
-                store.len()
+                "SchemaValidator initialized: {schema_count} schemas loaded, {overlays_applied} overlay schema(s) applied"
             );
+            OnceLock::from(store)
         } else {
-            info!("SchemaValidator initialized: {} schemas loaded", store.len());
-        }
-        SchemaValidator { store, catalog, init_metric, metadata_catalog: OnceLock::new() }
+            info!("SchemaValidator initialized: bundled schemas deferred until first use");
+            OnceLock::new()
+        };
+        let init_metric = phase_metric(start);
+        SchemaValidator { store: lazy_store, catalog, init_metric, metadata_catalog: OnceLock::new() }
+    }
+
+    fn store(&self) -> &CompiledSchemaStore {
+        self.store.get_or_init(|| {
+            validate::prewarm_statics();
+            CompiledSchemaStore::new()
+        })
     }
 
     pub fn init_metric(&self) -> &PhaseMetric {
@@ -447,7 +453,11 @@ impl SchemaValidator {
     /// it is unavailable in every region) rather than assuming a default region.
     pub fn validate(&self, model: &Arc<SemanticModel>, region: Option<&str>) -> SchemaValidationResult {
         let start = web_time::Instant::now();
-        let diagnostics = validate::validate_all_resources(&self.store, model, region);
+        let diagnostics = if model.resources.is_empty() {
+            Vec::new()
+        } else {
+            validate::validate_all_resources(self.store(), model, region)
+        };
         let metric = phase_metric(start);
         SchemaValidationResult { diagnostics, metric }
     }
@@ -457,32 +467,38 @@ impl SchemaValidator {
     /// errors.
     #[doc(hidden)]
     pub fn parameter_default_constraint_diagnostics(&self, model: &SemanticModel) -> Vec<Diagnostic> {
-        parameter_defaults::parameter_default_constraint_diagnostics(model, &self.store)
+        if model.resources.is_empty() {
+            Vec::new()
+        } else {
+            parameter_defaults::parameter_default_constraint_diagnostics(model, self.store())
+        }
     }
 
     pub fn enrich_context(&self, diagnostics: &mut [Diagnostic], model: &Arc<SemanticModel>) {
-        validate::enrich_schema_context(diagnostics, &self.store, model);
+        if !model.resources.is_empty() {
+            validate::enrich_schema_context(diagnostics, self.store(), model);
+        }
     }
 
     pub fn schema_count(&self) -> usize {
-        self.store.len()
+        self.store().len()
     }
 
     /// Returns the schema fields needed to map request parameters to one
     /// CloudFormation resource type, including configured schema overlays.
     pub fn resource_schema_metadata(&self, type_name: &str) -> Option<ResourceSchemaMetadata> {
-        self.store.get(type_name).map(ResourceSchemaMetadata::from_compiled)
+        self.store().get(type_name).map(ResourceSchemaMetadata::from_compiled)
     }
 
     /// Whether this validator has a bundled or caller-provided schema for a
     /// CloudFormation resource type.
     pub fn has_resource_type(&self, type_name: &str) -> bool {
-        self.store.get(type_name).is_some()
+        self.store().get(type_name).is_some()
     }
 
     /// Iterates every bundled and caller-provided CloudFormation resource type.
     pub fn resource_type_names(&self) -> impl Iterator<Item = &str> {
-        self.store.type_names()
+        self.store().type_names()
     }
 
     pub fn list_rules(&self) -> Vec<RuleInfo> {
@@ -509,6 +525,37 @@ pub(crate) fn should_warn_for_inserted_type(type_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_schema_store_initializes_only_when_resource_validation_requires_it() {
+        let validator = SchemaValidator::default();
+        assert!(validator.store.get().is_none(), "default constructor should defer bundled schema parsing");
+
+        let empty = Arc::new(
+            SemanticModel::from_bytes(
+                br#"AWSTemplateFormatVersion: '2010-09-09'
+Resources: {}"#,
+            )
+            .expect("resource-free template parses"),
+        );
+        assert!(validator.validate(&empty, Some("us-east-1")).diagnostics.is_empty());
+        assert!(validator.parameter_default_constraint_diagnostics(&empty).is_empty());
+        let mut diagnostics = Vec::new();
+        validator.enrich_context(&mut diagnostics, &empty);
+        assert!(validator.store.get().is_none(), "resource-free validation must not initialize schemas");
+
+        let with_resource = Arc::new(
+            SemanticModel::from_bytes(
+                br#"Resources:
+  Bucket:
+    Type: AWS::S3::Bucket"#,
+            )
+            .expect("resource template parses"),
+        );
+        validator.validate(&with_resource, Some("us-east-1"));
+        assert!(validator.store.get().is_some(), "resource validation must initialize the schema store");
+        assert!(validator.has_resource_type("AWS::S3::Bucket"));
+    }
 
     #[test]
     fn new_without_overlays_matches_default_construction() {
@@ -671,12 +718,12 @@ Resources:
             "the process-wide base table must remain unchanged"
         );
         assert_eq!(
-            validator.store.ref_types().getatt_type_for("AWS::S3::Bucket", "OverlayAttribute"),
+            validator.store().ref_types().getatt_type_for("AWS::S3::Bucket", "OverlayAttribute"),
             Some("integer"),
             "the overlay validator's store sees the overlaid attribute type"
         );
         assert_eq!(
-            SchemaValidator::default().store.ref_types().getatt_type_for("AWS::S3::Bucket", "OverlayAttribute"),
+            SchemaValidator::default().store().ref_types().getatt_type_for("AWS::S3::Bucket", "OverlayAttribute"),
             None,
             "a default validator built afterwards must still see the untouched shared table"
         );

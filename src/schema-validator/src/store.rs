@@ -3,8 +3,9 @@ use crate::overlay::{self, SchemaOverlayError};
 use crate::shared_base_getatt_data;
 use data_source::embedded::*;
 use data_source::types::GetattData;
+use serde_json::value::RawValue;
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use template_model::regions::AWS_REGIONS;
 
 /// What applying an overlay did to the store.
@@ -21,8 +22,27 @@ pub enum OverlayOutcome {
     Inserted,
 }
 
+/// The embedded provider catalog is large, but a template ordinarily names only a
+/// handful of resource types. Preserve every bundled type in the index while
+/// deserializing the full schema only if validation or an overlay needs it.
+enum SchemaEntry {
+    Bundled { raw: Box<RawValue>, decoded: OnceLock<CompiledSchema> },
+    Modified(CompiledSchema),
+}
+
+impl SchemaEntry {
+    fn get(&self) -> &CompiledSchema {
+        match self {
+            Self::Bundled { raw, decoded } => decoded.get_or_init(|| {
+                serde_json::from_str(raw.get()).expect("Embedded compiled resource schema must be valid JSON")
+            }),
+            Self::Modified(schema) => schema,
+        }
+    }
+}
+
 pub struct CompiledSchemaStore {
-    schemas: HashMap<String, CompiledSchema>,
+    schemas: HashMap<String, SchemaEntry>,
     region_types: HashMap<String, HashMap<String, bool>>,
     ref_types: RefTypeStore,
     lifecycle: LifecycleStore,
@@ -38,8 +58,12 @@ impl Default for CompiledSchemaStore {
 
 impl CompiledSchemaStore {
     pub fn new() -> Self {
-        let schemas: HashMap<String, CompiledSchema> =
+        let bundled: HashMap<String, Box<RawValue>> =
             serde_json::from_slice(&COMPILED_SCHEMAS_BYTES).expect("Embedded compiled schemas must be valid JSON");
+        let schemas: HashMap<String, SchemaEntry> = bundled
+            .into_iter()
+            .map(|(type_name, raw)| (type_name, SchemaEntry::Bundled { raw, decoded: OnceLock::new() }))
+            .collect();
         assert!(!schemas.is_empty(), "Embedded compiled schemas must not be empty");
         let ref_types = RefTypeStore::load(&REF_TYPES_BYTES);
         let lifecycle = LifecycleStore::load(&RESOURCE_LIFECYCLE_BYTES, &LAMBDA_RUNTIMES_BYTES);
@@ -98,7 +122,7 @@ impl CompiledSchemaStore {
     }
 
     pub fn get(&self, type_name: &str) -> Option<&CompiledSchema> {
-        self.schemas.get(type_name)
+        self.schemas.get(type_name).map(SchemaEntry::get)
     }
 
     pub fn type_names(&self) -> impl Iterator<Item = &str> {
@@ -129,20 +153,21 @@ impl CompiledSchemaStore {
         let overlay = overlay::compile(type_name, raw)?;
         overlay::validate_schema(&overlay)?;
         match self.schemas.get(type_name) {
-            Some(existing) => {
+            Some(entry) => {
+                let existing = entry.get();
                 let mut merged = existing.clone();
                 overlay::merge_into(&mut merged, overlay);
                 overlay::validate_schema(&merged)?;
                 overlay::warn_removed_required(existing, &merged);
                 overlay::warn_dangling_refs(&merged);
                 self.ref_types.update_from_schema(&merged);
-                self.schemas.insert(type_name.to_string(), merged);
+                self.schemas.insert(type_name.to_string(), SchemaEntry::Modified(merged));
                 Ok(OverlayOutcome::Merged)
             }
             None => {
                 overlay::warn_dangling_refs(&overlay);
                 self.ref_types.update_from_schema(&overlay);
-                self.schemas.insert(type_name.to_string(), overlay);
+                self.schemas.insert(type_name.to_string(), SchemaEntry::Modified(overlay));
                 Ok(OverlayOutcome::Inserted)
             }
         }
@@ -153,7 +178,7 @@ impl CompiledSchemaStore {
     /// artifacts do not yet contain.
     #[cfg(test)]
     pub(crate) fn insert_schema(&mut self, schema: CompiledSchema) {
-        self.schemas.insert(schema.type_name.clone(), schema);
+        self.schemas.insert(schema.type_name.clone(), SchemaEntry::Modified(schema));
     }
 
     pub fn len(&self) -> usize {
@@ -420,7 +445,7 @@ impl ExtensionStore {
     /// Remap extension keys to match canonical resource type names.
     /// Extension source files may produce keys like "Aws::Rds::Dbcluster"
     /// but the actual type names are "AWS::RDS::DBCluster".
-    pub fn remap_keys(&mut self, known_types: &HashMap<String, CompiledSchema>) {
+    pub fn remap_keys<T>(&mut self, known_types: &HashMap<String, T>) {
         let lowercase_to_canonical: HashMap<String, String> =
             known_types.keys().map(|k| (k.to_lowercase(), k.clone())).collect();
         let old_keys: Vec<String> = self.extensions.keys().cloned().collect();
@@ -503,10 +528,26 @@ mod tests {
     }
 
     #[test]
-    fn store_get_known_type() {
+    fn store_get_known_type_decodes_only_requested_resource() {
         let store = CompiledSchemaStore::new();
+        let loaded = || {
+            store
+                .schemas
+                .values()
+                .filter(|entry| matches!(entry, SchemaEntry::Bundled { decoded, .. } if decoded.get().is_some()))
+                .count()
+        };
+        assert_eq!(loaded(), 0, "constructor must not decode every bundled schema");
         let schema = store.get("AWS::S3::Bucket").expect("expected AWS::S3::Bucket schema");
         assert_eq!(schema.type_name, "AWS::S3::Bucket");
+        assert_eq!(loaded(), 1);
+        let again = store.get("AWS::S3::Bucket").expect("expected cached AWS::S3::Bucket schema");
+        assert!(std::ptr::eq(schema, again), "repeated lookups must reuse the decoded schema");
+        assert_eq!(loaded(), 1);
+        assert!(store.get("AWS::Fake::NonExistent").is_none());
+        assert_eq!(loaded(), 1, "unknown resources must not decode unrelated schemas");
+        assert!(store.get("AWS::EC2::Instance").is_some());
+        assert_eq!(loaded(), 2);
     }
 
     #[test]
