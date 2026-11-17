@@ -4,7 +4,7 @@ use crate::shared_base_getatt_data;
 use data_source::embedded::*;
 use data_source::types::GetattData;
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use template_model::regions::AWS_REGIONS;
 
 /// What applying an overlay did to the store.
@@ -21,13 +21,14 @@ pub enum OverlayOutcome {
     Inserted,
 }
 
+#[derive(Clone)]
 pub struct CompiledSchemaStore {
-    schemas: HashMap<String, CompiledSchema>,
-    region_types: HashMap<String, HashMap<String, bool>>,
-    ref_types: RefTypeStore,
-    lifecycle: LifecycleStore,
-    extensions: ExtensionStore,
-    region_enums: RegionEnumStore,
+    schemas: Arc<HashMap<String, CompiledSchema>>,
+    region_types: Arc<HashMap<String, HashMap<String, bool>>>,
+    ref_types: Arc<RefTypeStore>,
+    lifecycle: Arc<LifecycleStore>,
+    extensions: Arc<ExtensionStore>,
+    region_enums: Arc<RegionEnumStore>,
 }
 
 impl Default for CompiledSchemaStore {
@@ -38,6 +39,11 @@ impl Default for CompiledSchemaStore {
 
 impl CompiledSchemaStore {
     pub fn new() -> Self {
+        static EMBEDDED_STORE: OnceLock<CompiledSchemaStore> = OnceLock::new();
+        EMBEDDED_STORE.get_or_init(Self::from_embedded).clone()
+    }
+
+    fn from_embedded() -> Self {
         let schemas: HashMap<String, CompiledSchema> =
             serde_json::from_slice(&COMPILED_SCHEMAS_BYTES).expect("Embedded compiled schemas must be valid JSON");
         assert!(!schemas.is_empty(), "Embedded compiled schemas must not be empty");
@@ -48,12 +54,12 @@ impl CompiledSchemaStore {
         let region_enums =
             RegionEnumStore::load(&REGION_ENUMS_BYTES).expect("Embedded region_enums data must be valid and populated");
         let mut store = CompiledSchemaStore {
-            schemas,
-            region_types: HashMap::new(),
-            ref_types,
-            lifecycle,
-            extensions,
-            region_enums,
+            schemas: Arc::new(schemas),
+            region_types: Arc::new(HashMap::new()),
+            ref_types: Arc::new(ref_types),
+            lifecycle: Arc::new(lifecycle),
+            extensions: Arc::new(extensions),
+            region_enums: Arc::new(region_enums),
         };
         // Load the embedded per-region resource-type map so region-availability
         // (F3006) validates against the target region. Without this the region
@@ -93,7 +99,7 @@ impl CompiledSchemaStore {
             let type_map = type_object.keys().map(|resource_type| (resource_type.clone(), true)).collect();
             parsed_regions.insert(region.clone(), type_map);
         }
-        self.region_types.extend(parsed_regions);
+        Arc::make_mut(&mut self.region_types).extend(parsed_regions);
         Ok(())
     }
 
@@ -135,14 +141,14 @@ impl CompiledSchemaStore {
                 overlay::validate_schema(&merged)?;
                 overlay::warn_removed_required(existing, &merged);
                 overlay::warn_dangling_refs(&merged);
-                self.ref_types.update_from_schema(&merged);
-                self.schemas.insert(type_name.to_string(), merged);
+                Arc::make_mut(&mut self.ref_types).update_from_schema(&merged);
+                Arc::make_mut(&mut self.schemas).insert(type_name.to_string(), merged);
                 Ok(OverlayOutcome::Merged)
             }
             None => {
                 overlay::warn_dangling_refs(&overlay);
-                self.ref_types.update_from_schema(&overlay);
-                self.schemas.insert(type_name.to_string(), overlay);
+                Arc::make_mut(&mut self.ref_types).update_from_schema(&overlay);
+                Arc::make_mut(&mut self.schemas).insert(type_name.to_string(), overlay);
                 Ok(OverlayOutcome::Inserted)
             }
         }
@@ -153,7 +159,7 @@ impl CompiledSchemaStore {
     /// artifacts do not yet contain.
     #[cfg(test)]
     pub(crate) fn insert_schema(&mut self, schema: CompiledSchema) {
-        self.schemas.insert(schema.type_name.clone(), schema);
+        Arc::make_mut(&mut self.schemas).insert(schema.type_name.clone(), schema);
     }
 
     pub fn len(&self) -> usize {
@@ -193,6 +199,7 @@ impl CompiledSchemaStore {
     }
 }
 
+#[derive(Clone)]
 pub struct RefTypeStore {
     ref_returns: HashMap<String, String>,
     /// The shared process-wide GetAtt table, or this store's own copy once an
@@ -500,6 +507,45 @@ mod tests {
     fn store_loads_nonempty() {
         let store = CompiledSchemaStore::new();
         assert!(store.len() > 0, "store should have schemas, got {}", store.len());
+    }
+
+    #[test]
+    fn default_stores_share_embedded_schemas_without_copying() {
+        let first = CompiledSchemaStore::new();
+        let second = CompiledSchemaStore::new();
+
+        assert!(Arc::ptr_eq(&first.schemas, &second.schemas), "default instances must reuse parsed schemas");
+        assert!(Arc::ptr_eq(&first.region_types, &second.region_types));
+        assert!(Arc::ptr_eq(&first.ref_types, &second.ref_types));
+        assert!(Arc::ptr_eq(&first.extensions, &second.extensions));
+        assert_eq!(first.len(), second.len());
+    }
+
+    #[test]
+    fn adding_a_schema_does_not_change_other_default_stores() {
+        let mut modified = CompiledSchemaStore::new();
+        let original = CompiledSchemaStore::new();
+        let type_name = "Custom::Local::Only";
+        modified.insert_schema(CompiledSchema { type_name: type_name.to_string(), ..Default::default() });
+
+        assert_eq!(modified.get(type_name).map(|schema| schema.type_name.as_str()), Some(type_name));
+        assert!(original.get(type_name).is_none(), "the global embedded store must remain unchanged");
+        assert!(!Arc::ptr_eq(&modified.schemas, &original.schemas));
+    }
+
+    #[test]
+    fn editing_region_data_does_not_change_other_default_stores() {
+        let mut modified = CompiledSchemaStore::new();
+        let original = CompiledSchemaStore::new();
+        let type_name = "Custom::Local::RegionOnly";
+        assert!(!original.is_available_in_region(type_name, "us-east-1"));
+
+        modified
+            .load_region_data(br#"{"region_resource_types":{"us-east-1":{"Custom::Local::RegionOnly":true}}}"#)
+            .expect("valid region data");
+        assert!(modified.is_available_in_region(type_name, "us-east-1"));
+        assert!(!original.is_available_in_region(type_name, "us-east-1"));
+        assert!(!Arc::ptr_eq(&modified.region_types, &original.region_types));
     }
 
     #[test]

@@ -81,7 +81,7 @@ pub fn init() {
             console_error_panic_hook::hook(info);
         }));
     });
-    schema_validator::prewarm_embedded_data();
+    // Data not used by a caller should stay compressed until its first read.
 }
 
 /// Registers the host callback that receives panic messages. A panic still
